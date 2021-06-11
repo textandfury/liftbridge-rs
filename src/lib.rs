@@ -2,7 +2,7 @@ pub mod error;
 pub use error::{LiftbridgeError, Result};
 
 mod api {
-    include!(concat!(env!("OUT_DIR"), "/proto.rs"));
+    include!(concat!(env!("OUT_DIR"), "/client_api.v1.rs"));
 }
 pub mod metadata {
     use crate::api::{FetchMetadataResponse, StreamMetadata};
@@ -29,10 +29,6 @@ pub mod metadata {
     }
 
     impl Metadata {
-        pub fn last_updated(&self) -> DateTime<Utc> {
-            self.last_updated
-        }
-
         fn get_addrs(&self) -> Vec<String> {
             self.brokers
                 .values()
@@ -121,7 +117,7 @@ pub mod client {
         AckPolicy, CreateStreamRequest, CreateStreamResponse, DeleteStreamRequest,
         DeleteStreamResponse, FetchMetadataRequest, FetchMetadataResponse, Message,
         PauseStreamRequest, PauseStreamResponse, PublishRequest, PublishResponse, StartPosition,
-        SubscribeRequest,
+        StopPosition, SubscribeRequest,
     };
     use crate::{LiftbridgeError, Result};
     use std::convert::TryFrom;
@@ -133,24 +129,17 @@ pub mod client {
     use crate::metadata::MetadataCache;
 
     use lru::LruCache;
+    use parking_lot::{Mutex, RwLock};
     use rand::seq::SliceRandom;
     use rand::{thread_rng, Rng};
     use std::collections::HashMap;
-    use std::sync::{Mutex, RwLock};
     use tonic::transport::{Channel, Endpoint};
     use tonic::{Code, Status, Streaming};
 
-    // To be implemented via load-balancing two endpoints connected to the same broker
-    const MAX_BROKER_CONNECTIONS: usize = 2;
     const KEEP_ALIVE_DURATION: Duration = Duration::from_secs(30);
     const RESUBSCRIBE_WAIT_TIME: Duration = Duration::from_secs(30);
-    const ACK_WAIT_TIME: Duration = Duration::from_secs(5);
     const NO_OFFSET: i64 = -1;
     const DEFAULT_POOL_SIZE: usize = 100;
-
-    pub struct Config {
-        timeout: Option<Duration>,
-    }
 
     #[derive(Clone)]
     enum Request {
@@ -207,8 +196,53 @@ pub mod client {
         start_position: StartPosition,
         start_offset: i64,
         start_timestamp: i64,
-        partition: i32,
         read_isr_replica: bool,
+        stop_position: StopPosition,
+        stop_offet: i64,
+        stop_timestamp: i64,
+        pub partition: i32,
+        pub resume: bool,
+    }
+
+    impl Default for SubscriptionOptions {
+        fn default() -> Self {
+            Self {
+                start_position: StartPosition::NewOnly,
+                start_offset: 0,
+                start_timestamp: 0,
+                read_isr_replica: false,
+                partition: 0,
+                resume: false,
+                stop_position: StopPosition::StopOnCancel,
+                stop_offet: -1,
+                stop_timestamp: -1,
+            }
+        }
+    }
+
+    impl SubscriptionOptions {
+        pub fn start_at_offset(mut self, offset: i64) -> Self {
+            self.start_position = StartPosition::Offset;
+            self.start_offset = offset;
+            self
+        }
+
+        pub fn start_at_time(mut self, time: chrono::DateTime<Utc>) -> Self {
+            self.start_position = StartPosition::Timestamp;
+            self.start_timestamp = time.timestamp();
+            self
+        }
+
+        pub fn start_at_time_delta(mut self, ago: Duration) -> Self {
+            self.start_position = StartPosition::Timestamp;
+            self.start_timestamp = Utc::now().timestamp() - ago.as_secs() as i64;
+            self
+        }
+
+        pub fn start_at_earliest(mut self) -> Self {
+            self.start_position = StartPosition::Earliest;
+            self
+        }
     }
 
     pub struct Subscription<'a> {
@@ -286,52 +320,12 @@ pub mod client {
         }
     }
 
-    impl Default for SubscriptionOptions {
-        fn default() -> Self {
-            Self {
-                start_position: StartPosition::NewOnly,
-                start_offset: 0,
-                start_timestamp: 0,
-                read_isr_replica: false,
-                partition: 0,
-            }
-        }
-    }
-
-    impl SubscriptionOptions {
-        pub fn start_at_offset(mut self, offset: i64) -> Self {
-            self.start_position = StartPosition::Offset;
-            self.start_offset = offset;
-            self
-        }
-
-        pub fn start_at_time(mut self, time: chrono::DateTime<Utc>) -> Self {
-            self.start_position = StartPosition::Timestamp;
-            self.start_timestamp = time.timestamp();
-            self
-        }
-
-        pub fn start_at_time_delta(mut self, ago: Duration) -> Self {
-            self.start_position = StartPosition::Timestamp;
-            self.start_timestamp = Utc::now().timestamp() - ago.as_secs() as i64;
-            self
-        }
-
-        pub fn start_at_earliest(mut self) -> Self {
-            self.start_position = StartPosition::Earliest;
-            self
-        }
-
-        pub fn partition(mut self, partition: u32) -> Self {
-            self.partition = partition as i32;
-            self
-        }
-    }
-
     trait Partitioner {
         // fn partition(stream: &str, key: Vec<u8>, value: Vec<u8>, metadata: Option<Metadata>)
     }
 
+    // TODO: implement message serialization using the following options
+    #[allow(dead_code)]
     struct MessageOptions {
         // Key to set on the Message. If Liftbridge has stream compaction enabled,
         // the stream will retain only the last value for each key.
@@ -377,7 +371,7 @@ pub mod client {
 
         async fn change_broker(&self) -> Result<()> {
             let new_client = Client::connect_any(&mut self.metadata.get_addrs()).await?;
-            let mut client = self.client.write().unwrap();
+            let mut client = self.client.write();
             *client = new_client;
             Ok(())
         }
@@ -404,7 +398,7 @@ pub mod client {
 
         async fn request(&self, msg: Request) -> Result<Response> {
             for _ in 0..9 {
-                let client = self.client.read().unwrap();
+                let client = self.client.read();
                 let res = self._request(client.clone(), &msg).await;
                 match res {
                     Err(LiftbridgeError::GrpcError(status))
@@ -507,6 +501,10 @@ pub mod client {
                 start_position: options.start_position.into(),
                 stream: stream.to_string(),
                 read_isr_replica: options.read_isr_replica,
+                resume: options.resume,
+                stop_position: options.stop_position.into(),
+                stop_offset: options.stop_offet,
+                stop_timestamp: options.stop_timestamp,
             };
 
             for i in 0..4 {
@@ -516,9 +514,7 @@ pub mod client {
                 match client {
                     Err(_) => {
                         tokio::time::sleep(Duration::from_millis(50)).await;
-                        //TODO: Ignore the result of this, if it fails on all the retries
-                        // this will result in a general failure
-                        self.update_metadata().await;
+                        let _ = self.update_metadata().await; // If it fails on all the retries this will result in a general failure
                     }
                     Ok(client) => {
                         let sub = self
@@ -545,7 +541,7 @@ pub mod client {
                                                     10 + i * 50,
                                                 ))
                                                 .await;
-                                                self.update_metadata().await;
+                                                let _ = self.update_metadata().await;
                                                 continue;
                                             }
 
@@ -564,8 +560,7 @@ pub mod client {
                                 if status.code() == tonic::Code::Unavailable =>
                             {
                                 tokio::time::sleep(Duration::from_millis(50)).await;
-                                // ignore the result on purpose as we will fail eventually anyway
-                                self.update_metadata().await;
+                                let _ = self.update_metadata().await; // ignore the result on purpose as we will fail eventually anyway
                                 continue;
                             }
                             _ => {
@@ -599,6 +594,7 @@ pub mod client {
                 ack_inbox: "".to_string(),
                 correlation_id: "".to_string(),
                 key: Vec::new(),
+                expected_offset: -1,
             };
             self.request(Request::Publish(req)).await?;
             Ok(())
@@ -626,7 +622,7 @@ pub mod client {
                 .metadata
                 .get_addr(stream, partition, read_isr_replica)?;
 
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock();
             if pool.contains(&addr) {
                 return Ok(pool.get(&addr).unwrap().clone());
             }

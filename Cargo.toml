@@ -19,6 +19,7 @@ chrono = "0.4"
 tokio = { version = "1.6", features = ["time"] }
 rand = "0.8"
 lru = "0.6"
+parking_lot = "0.11"
 
 [build-dependencies]
 tonic-build = "0.4"

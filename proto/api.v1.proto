@@ -1,5 +1,5 @@
 syntax = "proto3";
-package liftbridge_client_api.v1;
+package client_api.v1;
 
 option java_package = "io.liftbridge.proto";
 
