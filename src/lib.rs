@@ -100,7 +100,7 @@ pub mod metadata {
 
             if read_isr_replica {
                 let replicas = &partition.isr;
-                let replica = rand::thread_rng().gen_range(0, replicas.len());
+                let replica = rand::thread_rng().gen_range(0..replicas.len());
 
                 let replica = replicas.get(replica).unwrap();
                 return Ok(metadata.brokers.get(replica).unwrap().clone());
@@ -259,10 +259,10 @@ pub mod client {
                         match sub {
                             Err(e) => {
                                 if let LiftbridgeError::UnableToSubscribe = e {
-                                    tokio::time::delay_for(
+                                    tokio::time::sleep(
                                         Duration::from_secs(1)
                                             + Duration::from_millis(
-                                                rand::thread_rng().gen_range(1, 500),
+                                                rand::thread_rng().gen_range(1..500),
                                             ),
                                     )
                                     .await;
@@ -515,7 +515,7 @@ pub mod client {
                     .await;
                 match client {
                     Err(_) => {
-                        tokio::time::delay_for(Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         //TODO: Ignore the result of this, if it fails on all the retries
                         // this will result in a general failure
                         self.update_metadata().await;
@@ -541,7 +541,7 @@ pub mod client {
                                         Err(status) => {
                                             if status.code() == tonic::Code::FailedPrecondition {
                                                 // ignore the result, this will result in general failure
-                                                tokio::time::delay_for(Duration::from_millis(
+                                                tokio::time::sleep(Duration::from_millis(
                                                     10 + i * 50,
                                                 ))
                                                 .await;
@@ -563,7 +563,7 @@ pub mod client {
                             Err(LiftbridgeError::GrpcError(status))
                                 if status.code() == tonic::Code::Unavailable =>
                             {
-                                tokio::time::delay_for(Duration::from_millis(50)).await;
+                                tokio::time::sleep(Duration::from_millis(50)).await;
                                 // ignore the result on purpose as we will fail eventually anyway
                                 self.update_metadata().await;
                                 continue;
